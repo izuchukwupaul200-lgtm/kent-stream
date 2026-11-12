@@ -58,7 +58,6 @@ async function flutterwaveRequest(url) {
     headers: {
       Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
       Accept: "application/json",
-      "Content-Type": "application/json",
     },
   });
 
@@ -78,7 +77,7 @@ async function flutterwaveRequest(url) {
   }
 
   if (!response.ok || result.status !== "success" || !result.data) {
-    console.error("Flutterwave API verification failed:", {
+    console.error("Flutterwave API request failed:", {
       httpStatus: response.status,
       apiStatus: result.status,
       message: result.message,
@@ -96,30 +95,19 @@ async function verifyByReference(txRef) {
     "https://api.flutterwave.com/v3/transactions/verify_by_reference" +
     `?tx_ref=${encodeURIComponent(txRef)}`;
 
-  const payment = await flutterwaveRequest(url);
-
-  console.log("FLUTTERWAVE REFERENCE VERIFICATION:", {
-    transactionId: payment.id,
-    tx_ref: payment.tx_ref,
-    status: payment.status,
-    amount: payment.amount,
-    charged_amount: payment.charged_amount,
-    currency: payment.currency,
-  });
-
-  return payment;
+  return await flutterwaveRequest(url);
 }
 
 // VERIFY USING FLUTTERWAVE TRANSACTION ID
 async function verifyWithFlutterwave(transactionId) {
   const url =
-    `https://api.flutterwave.com/v3/transactions/` +
+    "https://api.flutterwave.com/v3/transactions/" +
     `${encodeURIComponent(transactionId)}/verify`;
 
   return await flutterwaveRequest(url);
 }
 
-// VALIDATE VERIFIED PAYMENT
+// VALIDATE PAYMENT AGAINST THE NIGERIAN SUBSCRIPTION PRICE
 function validatePayment(payment, expectedTxRef) {
   if (!payment || payment.status !== "successful") {
     throw new Error("Transaction is not successful.");
@@ -133,7 +121,9 @@ function validatePayment(payment, expectedTxRef) {
     throw new Error("Payment currency does not match.");
   }
 
-  if (Number(payment.amount) < PRICE) {
+  const paidAmount = Number(payment.amount);
+
+  if (!Number.isFinite(paidAmount) || paidAmount < PRICE) {
     throw new Error("Payment amount is below the subscription price.");
   }
 
@@ -144,7 +134,26 @@ function validatePayment(payment, expectedTxRef) {
   return true;
 }
 
-// SAVE PAYMENT AND ACTIVATE SUBSCRIPTION
+// CHECK PAYMENT CUSTOMER DETAILS
+function validatePaymentCustomer(payment, user) {
+  if (
+    payment.meta?.user_id &&
+    payment.meta.user_id !== user.id
+  ) {
+    throw new Error("Payment user does not match.");
+  }
+
+  if (
+    payment.customer?.email &&
+    user.email &&
+    payment.customer.email.toLowerCase() !==
+      user.email.toLowerCase()
+  ) {
+    throw new Error("Payment customer email does not match.");
+  }
+}
+
+// SAVE VERIFIED PAYMENT AND ACTIVATE SUBSCRIPTION
 async function activateVerifiedPayment(payment, pending) {
   validatePayment(payment, pending.tx_ref);
 
@@ -157,74 +166,19 @@ async function activateVerifiedPayment(payment, pending) {
     throw new Error("Payment user mismatch.");
   }
 
-  // CHECK WHETHER TRANSACTION WAS ALREADY RECORDED
-  const { data: existingPayment, error: existingError } =
-    await supabase
-      .from("flutterwave_payments")
-      .select("transaction_id, user_id, tx_ref")
-      .eq("transaction_id", transactionId)
-      .maybeSingle();
-
-  if (existingError) {
-    throw existingError;
-  }
-
-  if (existingPayment) {
-    if (
-      existingPayment.user_id !== pending.user_id ||
-      existingPayment.tx_ref !== pending.tx_ref
-    ) {
-      throw new Error(
-        "Transaction already belongs to another payment."
-      );
-    }
-
-    // Do not insert a duplicate payment.
-    // Ensure the subscription is activated through the RPC.
-    const { data: activated, error: activationError } =
-      await supabase.rpc("activate_kent_stream_payment", {
-        p_transaction_id: transactionId,
-        p_user_id: pending.user_id,
-        p_tx_ref: pending.tx_ref,
-        p_amount: PRICE,
-        p_currency: CURRENCY,
-      });
-
-    if (activationError) {
-      throw activationError;
-    }
-
-    if (activated !== true) {
-      throw new Error("Supabase did not confirm subscription activation.");
-    }
-
-    const { error: pendingUpdateError } = await supabase
-      .from("flutterwave_pending_payments")
-      .update({
-        status: "paid",
-        transaction_id: transactionId,
-      })
-      .eq("tx_ref", pending.tx_ref)
-      .eq("user_id", pending.user_id);
-
-    if (pendingUpdateError) {
-      throw pendingUpdateError;
-    }
-
-    return true;
-  }
-
-  // ACTIVATE THROUGH YOUR EXISTING SUPABASE RPC
+  // Record the actual verified transaction amount and currency.
+  // The RPC safely handles duplicate transaction IDs.
   const { data: activated, error: activationError } =
     await supabase.rpc("activate_kent_stream_payment", {
       p_transaction_id: transactionId,
       p_user_id: pending.user_id,
       p_tx_ref: pending.tx_ref,
-      p_amount: PRICE,
-      p_currency: CURRENCY,
+      p_amount: Number(payment.amount),
+      p_currency: payment.currency,
     });
 
   if (activationError) {
+    console.error("Supabase activation error:", activationError);
     throw activationError;
   }
 
@@ -232,7 +186,7 @@ async function activateVerifiedPayment(payment, pending) {
     throw new Error("Supabase did not confirm subscription activation.");
   }
 
-  // MARK PENDING PAYMENT AS PAID
+  // Mark this pending payment as paid.
   const { error: updateError } = await supabase
     .from("flutterwave_pending_payments")
     .update({
@@ -243,16 +197,35 @@ async function activateVerifiedPayment(payment, pending) {
     .eq("user_id", pending.user_id);
 
   if (updateError) {
+    console.error("Pending payment update error:", updateError);
     throw updateError;
   }
 
-  console.log("KENT STREAM SUBSCRIPTION ACTIVATED:", {
+  console.log("KENT STREAM PAYMENT ACTIVATED:", {
     user_id: pending.user_id,
     tx_ref: pending.tx_ref,
     transaction_id: transactionId,
+    amount: payment.amount,
+    currency: payment.currency,
   });
 
   return true;
+}
+
+// FIND A USER'S PENDING PAYMENT
+async function findPendingPayment(txRef, userId) {
+  const { data, error } = await supabase
+    .from("flutterwave_pending_payments")
+    .select("*")
+    .eq("tx_ref", txRef)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
 }
 
 // HOME
@@ -333,7 +306,7 @@ app.post(
   }
 );
 
-// VERIFY IN-APP PAYMENT USING tx_ref
+// VERIFY IN-APP PAYMENT
 app.post(
   "/api/flutterwave/verify",
   express.json(),
@@ -355,17 +328,7 @@ app.post(
         });
       }
 
-      const { data: pending, error: pendingError } =
-        await supabase
-          .from("flutterwave_pending_payments")
-          .select("*")
-          .eq("tx_ref", txRef)
-          .eq("user_id", user.id)
-          .maybeSingle();
-
-      if (pendingError) {
-        throw pendingError;
-      }
+      const pending = await findPendingPayment(txRef, user.id);
 
       if (!pending) {
         return res.status(404).json({
@@ -389,15 +352,7 @@ app.post(
       const payment = await verifyByReference(txRef);
 
       validatePayment(payment, txRef);
-
-      if (
-        payment.customer?.email &&
-        user.email &&
-        payment.customer.email.toLowerCase() !==
-          user.email.toLowerCase()
-      ) {
-        throw new Error("Customer email does not match.");
-      }
+      validatePaymentCustomer(payment, user);
 
       await activateVerifiedPayment(payment, pending);
 
@@ -430,7 +385,6 @@ app.post(
         });
       }
 
-      // Only retrieve this user's pending payments.
       const { data: pendingPayments, error } = await supabase
         .from("flutterwave_pending_payments")
         .select("*")
@@ -450,9 +404,6 @@ app.post(
         });
       }
 
-      let lastVerificationError = null;
-
-      // Verify each existing payment reference.
       for (const pending of pendingPayments) {
         try {
           console.log("Recovering existing payment:", {
@@ -463,22 +414,7 @@ app.post(
           const payment = await verifyByReference(pending.tx_ref);
 
           validatePayment(payment, pending.tx_ref);
-
-          if (
-            payment.meta?.user_id &&
-            payment.meta.user_id !== user.id
-          ) {
-            throw new Error("Payment user mismatch.");
-          }
-
-          if (
-            payment.customer?.email &&
-            user.email &&
-            payment.customer.email.toLowerCase() !==
-              user.email.toLowerCase()
-          ) {
-            throw new Error("Customer email does not match.");
-          }
+          validatePaymentCustomer(payment, user);
 
           await activateVerifiedPayment(payment, pending);
 
@@ -495,19 +431,12 @@ app.post(
               "Your payment was recovered and your subscription activated.",
           });
         } catch (verificationError) {
-          lastVerificationError = verificationError;
-
-          console.log("Pending payment was not recovered:", {
+          console.log("Pending payment not recovered:", {
             tx_ref: pending.tx_ref,
             reason: verificationError.message,
           });
         }
       }
-
-      console.error("No successful pending payment was recovered:", {
-        user_id: user.id,
-        last_error: lastVerificationError?.message,
-      });
 
       return res.json({
         status: "success",
@@ -525,6 +454,29 @@ app.post(
   }
 );
 
+// COMPARE WEBHOOK SIGNATURE SAFELY
+function validWebhookSignature(signature) {
+  const configuredHash = process.env.FLW_WEBHOOK_HASH;
+
+  if (
+    typeof signature !== "string" ||
+    typeof configuredHash !== "string" ||
+    !signature ||
+    !configuredHash
+  ) {
+    return false;
+  }
+
+  const received = Buffer.from(signature);
+  const expected = Buffer.from(configuredHash);
+
+  if (received.length !== expected.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(received, expected);
+}
+
 // FLUTTERWAVE WEBHOOK
 app.post(
   "/api/flutterwave/webhook",
@@ -533,20 +485,19 @@ app.post(
     try {
       const signature = req.headers["verif-hash"];
 
-      if (
-        !signature ||
-        !process.env.FLW_WEBHOOK_HASH ||
-        signature !== process.env.FLW_WEBHOOK_HASH
-      ) {
-        console.error("Invalid Flutterwave webhook signature:", {
-          signaturePresent: Boolean(signature),
-          webhookHashConfigured: Boolean(
-            process.env.FLW_WEBHOOK_HASH
-          ),
-        });
+      if (!validWebhookSignature(signature)) {
+        console.error("Invalid Flutterwave webhook signature.");
 
         return res.status(401).json({
           error: "Invalid webhook signature.",
+        });
+      }
+
+      if (!Buffer.isBuffer(req.body)) {
+        console.error("Webhook body was not received as raw JSON.");
+
+        return res.status(400).json({
+          error: "Invalid webhook body.",
         });
       }
 
@@ -554,14 +505,23 @@ app.post(
       const transactionId = event?.data?.id;
 
       if (!transactionId) {
+        console.log("Webhook received without a transaction ID.");
+
         return res.status(200).json({
           received: true,
+          ignored: true,
         });
       }
 
+      // Never trust the webhook payload alone.
+      // Verify the transaction directly with Flutterwave.
       const payment = await verifyWithFlutterwave(
         String(transactionId)
       );
+
+      if (!payment.tx_ref) {
+        throw new Error("Verified payment has no transaction reference.");
+      }
 
       validatePayment(payment, payment.tx_ref);
 
@@ -586,6 +546,12 @@ app.post(
       }
 
       await activateVerifiedPayment(payment, pending);
+
+      console.log("FLUTTERWAVE WEBHOOK PROCESSED:", {
+        transaction_id: payment.id,
+        tx_ref: payment.tx_ref,
+        user_id: pending.user_id,
+      });
 
       return res.status(200).json({
         received: true,
