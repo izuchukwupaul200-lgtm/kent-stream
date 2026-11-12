@@ -6,21 +6,15 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const PRICE = 1200;
+const PRICE_NAIRA = 1200;
+const PRICE_KOBO = 120000;
 const CURRENCY = "NGN";
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 const required = [
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
-  "FLW_SECRET_KEY",
-  "FLW_PUBLIC_KEY",
-  "FLW_WEBHOOK_HASH",
-  "FLW_REDIRECT_URL",
+  "PAYSTACK_SECRET_KEY",
+  "PAYSTACK_PUBLIC_KEY",
 ];
 
 for (const key of required) {
@@ -32,6 +26,11 @@ for (const key of required) {
 if (typeof fetch !== "function") {
   throw new Error("Node.js 18 or newer is required.");
 }
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // AUTHENTICATE USER
 async function getAuthenticatedUser(req) {
@@ -51,183 +50,67 @@ async function getAuthenticatedUser(req) {
   return data.user;
 }
 
-// FLUTTERWAVE API REQUEST
-async function flutterwaveRequest(url) {
-  const response = await fetch(url, {
-    method: "GET",
+// PAYSTACK API REQUEST
+async function paystackRequest(path, method = "GET", body = null) {
+  const options = {
+    method,
     headers: {
-      Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
       Accept: "application/json",
+      "Content-Type": "application/json",
     },
-  });
+  };
+
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(
+    `https://api.paystack.co${path}`,
+    options
+  );
 
   const responseText = await response.text();
-
   let result;
 
   try {
     result = JSON.parse(responseText);
   } catch {
-    console.error("Flutterwave invalid response:", {
-      httpStatus: response.status,
-      response: responseText.slice(0, 300),
-    });
-
-    throw new Error("Flutterwave returned an invalid response.");
+    console.error("PAYSTACK INVALID RESPONSE:", responseText.slice(0, 300));
+    throw new Error("Paystack returned an invalid response.");
   }
 
-  if (!response.ok || result.status !== "success" || !result.data) {
-    console.error("Flutterwave verification API error:", {
+  if (!response.ok || result.status !== true) {
+    console.error("PAYSTACK API ERROR:", {
       httpStatus: response.status,
-      apiStatus: result.status,
       message: result.message,
     });
 
-    throw new Error("Flutterwave transaction verification failed.");
+    throw new Error(result.message || "Paystack request failed.");
   }
 
   return result.data;
 }
 
-// VERIFY BY REFERENCE
-async function verifyByReference(txRef) {
-  const url =
-    "https://api.flutterwave.com/v3/transactions/verify_by_reference" +
-    `?tx_ref=${encodeURIComponent(txRef)}`;
-
-  return flutterwaveRequest(url);
-}
-
-// VERIFY BY TRANSACTION ID
-async function verifyWithFlutterwave(transactionId) {
-  const url =
-    "https://api.flutterwave.com/v3/transactions/" +
-    `${encodeURIComponent(transactionId)}/verify`;
-
-  return flutterwaveRequest(url);
-}
-
-// VALIDATE VERIFIED PAYMENT
-function validatePayment(payment, expectedTxRef) {
-  if (!payment || payment.status !== "successful") {
-    throw new Error("Transaction is not successful.");
-  }
-
-  if (payment.tx_ref !== expectedTxRef) {
-    throw new Error("Transaction reference mismatch.");
-  }
-
-  if (payment.currency !== CURRENCY) {
-    throw new Error("Payment currency mismatch.");
-  }
-
-  const amount = Number(payment.amount);
-
-  if (!Number.isFinite(amount) || amount < PRICE) {
-    throw new Error("Payment amount is below ₦1,200.");
-  }
-
-  if (!payment.id) {
-    throw new Error("Flutterwave transaction ID is missing.");
-  }
-
-  return true;
-}
-
-// VALIDATE CUSTOMER
-function validatePaymentCustomer(payment, user) {
-  if (
-    payment.meta?.user_id &&
-    payment.meta.user_id !== user.id
-  ) {
-    throw new Error("Payment user does not match.");
-  }
-
-  if (
-    payment.customer?.email &&
-    user.email &&
-    payment.customer.email.toLowerCase() !==
-      user.email.toLowerCase()
-  ) {
-    throw new Error("Payment email does not match.");
-  }
-}
-
-// ACTIVATE VERIFIED PAYMENT
-async function activateVerifiedPayment(payment, pending) {
-  validatePayment(payment, pending.tx_ref);
-
-  const transactionId = String(payment.id);
-
-  if (
-    payment.meta?.user_id &&
-    payment.meta.user_id !== pending.user_id
-  ) {
-    throw new Error("Payment user mismatch.");
-  }
-
-  const { data: activated, error: activationError } =
-    await supabase.rpc("activate_kent_stream_payment", {
-      p_transaction_id: transactionId,
-      p_user_id: pending.user_id,
-      p_tx_ref: pending.tx_ref,
-      p_amount: Number(payment.amount),
-      p_currency: payment.currency,
-    });
-
-  if (activationError) {
-    console.error("SUPABASE ACTIVATION ERROR:", {
-      message: activationError.message,
-      code: activationError.code,
-      details: activationError.details,
-      hint: activationError.hint,
-    });
-
-    throw new Error("Supabase subscription activation failed.");
-  }
-
-  if (activated !== true) {
-    throw new Error("Supabase did not confirm activation.");
-  }
-
-  const { error: updateError } = await supabase
-    .from("flutterwave_pending_payments")
-    .update({
-      status: "paid",
-      transaction_id: transactionId,
-    })
-    .eq("tx_ref", pending.tx_ref)
-    .eq("user_id", pending.user_id);
-
-  if (updateError) {
-    console.error("PENDING PAYMENT UPDATE ERROR:", {
-      message: updateError.message,
-      code: updateError.code,
-      details: updateError.details,
-    });
-
-    throw new Error("Could not update pending payment.");
-  }
-
-  console.log("KENT STREAM PAYMENT ACTIVATED:", {
-    user_id: pending.user_id,
-    tx_ref: pending.tx_ref,
-    transaction_id: transactionId,
-    amount: payment.amount,
-    currency: payment.currency,
-  });
-
-  return true;
+// VERIFY TRANSACTION WITH PAYSTACK
+async function verifyPaystackTransaction(reference) {
+  return paystackRequest(
+    `/transaction/verify/${encodeURIComponent(reference)}`
+  );
 }
 
 // FIND PENDING PAYMENT
-async function findPendingPayment(txRef, userId) {
-  const { data, error } = await supabase
-    .from("flutterwave_pending_payments")
+async function findPendingPayment(reference, userId = null) {
+  let query = supabase
+    .from("paystack_pending_payments")
     .select("*")
-    .eq("tx_ref", txRef)
-    .eq("user_id", userId)
-    .maybeSingle();
+    .eq("reference", reference);
+
+  if (userId) {
+    query = query.eq("user_id", userId);
+  }
+
+  const { data, error } = await query.maybeSingle();
 
   if (error) {
     console.error("PENDING PAYMENT LOOKUP ERROR:", error);
@@ -237,11 +120,107 @@ async function findPendingPayment(txRef, userId) {
   return data;
 }
 
+// VALIDATE VERIFIED PAYMENT
+function validatePaystackPayment(payment, pending) {
+  if (!payment || payment.status !== "success") {
+    throw new Error("Payment was not successful.");
+  }
+
+  if (payment.reference !== pending.reference) {
+    throw new Error("Payment reference mismatch.");
+  }
+
+  if (payment.currency !== CURRENCY) {
+    throw new Error("Payment currency mismatch.");
+  }
+
+  if (Number(payment.amount) !== PRICE_KOBO) {
+    throw new Error("Payment amount does not match ₦1,200.");
+  }
+
+  if (
+    payment.metadata?.user_id &&
+    payment.metadata.user_id !== pending.user_id
+  ) {
+    throw new Error("Payment user mismatch.");
+  }
+
+  if (
+    payment.customer?.email &&
+    pending.email &&
+    payment.customer.email.toLowerCase() !== pending.email.toLowerCase()
+  ) {
+    throw new Error("Payment email mismatch.");
+  }
+
+  if (!payment.id) {
+    throw new Error("Paystack transaction ID is missing.");
+  }
+
+  return true;
+}
+
+// ACTIVATE SUBSCRIPTION AFTER VERIFIED PAYMENT
+async function activateVerifiedPayment(payment, pending) {
+  validatePaystackPayment(payment, pending);
+
+  const { data: activated, error } = await supabase.rpc(
+    "activate_kent_stream_paystack_payment",
+    {
+      p_transaction_id: String(payment.id),
+      p_user_id: pending.user_id,
+      p_reference: pending.reference,
+      p_amount: Number(payment.amount) / 100,
+      p_currency: payment.currency,
+    }
+  );
+
+  if (error) {
+    console.error("SUBSCRIPTION ACTIVATION ERROR:", {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+    });
+
+    throw new Error("Subscription activation failed.");
+  }
+
+  if (activated !== true) {
+    throw new Error("Supabase did not confirm activation.");
+  }
+
+  const { error: updateError } = await supabase
+    .from("paystack_pending_payments")
+    .update({
+      status: "paid",
+      transaction_id: String(payment.id),
+    })
+    .eq("reference", pending.reference)
+    .eq("user_id", pending.user_id);
+
+  if (updateError) {
+    console.error("PENDING PAYMENT UPDATE ERROR:", updateError);
+    throw new Error("Could not update pending payment.");
+  }
+
+  console.log("KENT STREAM PAYSTACK PAYMENT ACTIVATED:", {
+    user_id: pending.user_id,
+    reference: pending.reference,
+    transaction_id: String(payment.id),
+    amount: PRICE_NAIRA,
+    currency: CURRENCY,
+  });
+
+  return true;
+}
+
 // HOME
 app.get("/", (req, res) => {
   res.json({
     name: "KENT STREAM API",
     status: "running",
+    payment_provider: "Paystack",
   });
 });
 
@@ -250,248 +229,41 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// PREPARE PAYMENT
+// PAYSTACK WEBHOOK
+// This must use the raw body before JSON parsing.
 app.post(
-  "/api/flutterwave/prepare",
-  express.json(),
+  "/api/paystack/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
   async (req, res) => {
     try {
-      const user = await getAuthenticatedUser(req);
+      const signature = req.headers["x-paystack-signature"];
 
-      if (!user) {
+      if (
+        !signature ||
+        !process.env.PAYSTACK_SECRET_KEY ||
+        !Buffer.isBuffer(req.body)
+      ) {
         return res.status(401).json({
-          error: "Please sign in first.",
+          received: false,
+          error: "Invalid webhook signature or body.",
         });
       }
 
-      if (!user.email) {
-        return res.status(400).json({
-          error: "Your account needs an email address.",
-        });
-      }
+      const expectedSignature = crypto
+        .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
+        .update(req.body)
+        .digest("hex");
 
-      const txRef = `KENT-${user.id}-${crypto.randomUUID()}`;
+      const receivedBuffer = Buffer.from(String(signature));
+      const expectedBuffer = Buffer.from(expectedSignature);
 
-      const { error } = await supabase
-        .from("flutterwave_pending_payments")
-        .insert({
-          tx_ref: txRef,
-          user_id: user.id,
-          amount: PRICE,
-          currency: CURRENCY,
-          status: "pending",
-        });
-
-      if (error) {
-        console.error("CREATE PENDING PAYMENT ERROR:", error);
-
-        return res.status(500).json({
-          error: "Unable to prepare payment.",
-        });
-      }
-
-      return res.json({
-        status: "success",
-        public_key: process.env.FLW_PUBLIC_KEY,
-        tx_ref: txRef,
-        amount: PRICE,
-        currency: CURRENCY,
-        redirect_url: process.env.FLW_REDIRECT_URL,
-        customer: {
-          email: user.email,
-          name:
-            user.user_metadata?.full_name ||
-            "KENT STREAM User",
-          phone: user.phone || "",
-        },
-      });
-    } catch (error) {
-      console.error("PAYMENT PREPARATION ERROR:", error);
-
-      return res.status(500).json({
-        error: "Payment preparation failed.",
-      });
-    }
-  }
-);
-
-// VERIFY PAYMENT FROM APP
-app.post(
-  "/api/flutterwave/verify",
-  express.json(),
-  async (req, res) => {
-    try {
-      const user = await getAuthenticatedUser(req);
-
-      if (!user) {
-        return res.status(401).json({
-          error: "Please sign in first.",
-        });
-      }
-
-      const txRef = req.body?.tx_ref;
-
-      if (typeof txRef !== "string" || !txRef.trim()) {
-        return res.status(400).json({
-          error: "Transaction reference is required.",
-        });
-      }
-
-      const pending = await findPendingPayment(txRef, user.id);
-
-      if (!pending) {
-        return res.status(404).json({
-          error: "Payment reference not found.",
-        });
-      }
-
-      if (pending.status === "paid") {
-        return res.json({
-          status: "success",
-          paid: true,
-          message: "Payment already confirmed.",
-        });
-      }
-
-      const payment = await verifyByReference(txRef);
-
-      validatePayment(payment, txRef);
-      validatePaymentCustomer(payment, user);
-
-      await activateVerifiedPayment(payment, pending);
-
-      return res.json({
-        status: "success",
-        paid: true,
-        message: "Payment verified and subscription activated.",
-      });
-    } catch (error) {
-      console.error("APP PAYMENT VERIFICATION ERROR:", error);
-
-      return res.status(400).json({
-        error: "Payment could not be verified. Please contact support.",
-      });
-    }
-  }
-);
-
-// RECOVER EXISTING PAYMENTS
-app.post(
-  "/api/flutterwave/recover",
-  express.json(),
-  async (req, res) => {
-    try {
-      const user = await getAuthenticatedUser(req);
-
-      if (!user) {
-        return res.status(401).json({
-          error: "Please sign in first.",
-        });
-      }
-
-      const { data: pendingPayments, error } = await supabase
-        .from("flutterwave_pending_payments")
-        .select("*")
-        .eq("user_id", user.id)
-        .eq("status", "pending")
-        .limit(10);
-
-      if (error) {
-        throw error;
-      }
-
-      if (!pendingPayments || pendingPayments.length === 0) {
-        return res.json({
-          status: "success",
-          paid: false,
-          message: "No pending payments were found.",
-        });
-      }
-
-      for (const pending of pendingPayments) {
-        try {
-          const payment = await verifyByReference(pending.tx_ref);
-
-          validatePayment(payment, pending.tx_ref);
-          validatePaymentCustomer(payment, user);
-
-          await activateVerifiedPayment(payment, pending);
-
-          return res.json({
-            status: "success",
-            paid: true,
-            message: "Your payment was recovered and activated.",
-          });
-        } catch (verificationError) {
-          console.log("RECOVERY ATTEMPT:", {
-            tx_ref: pending.tx_ref,
-            reason: verificationError.message,
-          });
-        }
-      }
-
-      return res.json({
-        status: "success",
-        paid: false,
-        message: "No successful payment was found.",
-      });
-    } catch (error) {
-      console.error("PAYMENT RECOVERY ERROR:", error);
-
-      return res.status(500).json({
-        error: "Payment recovery could not be completed.",
-      });
-    }
-  }
-);
-
-// CHECK FLUTTERWAVE WEBHOOK SIGNATURE
-function validWebhookSignature(signature) {
-  const configuredHash = process.env.FLW_WEBHOOK_HASH;
-
-  if (
-    typeof signature !== "string" ||
-    typeof configuredHash !== "string" ||
-    !signature ||
-    !configuredHash
-  ) {
-    return false;
-  }
-
-  const received = Buffer.from(signature);
-  const expected = Buffer.from(configuredHash);
-
-  if (received.length !== expected.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(received, expected);
-}
-
-// FLUTTERWAVE WEBHOOK
-// Keep this route before any global JSON body parser.
-app.post(
-  "/api/flutterwave/webhook",
-  express.raw({ type: "*/*", limit: "1mb" }),
-  async (req, res) => {
-    try {
-      const signature = req.headers["verif-hash"];
-
-      if (!validWebhookSignature(signature)) {
-        console.error("WEBHOOK ERROR: Invalid signature.");
-
+      if (
+        receivedBuffer.length !== expectedBuffer.length ||
+        !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)
+      ) {
         return res.status(401).json({
           received: false,
           error: "Invalid webhook signature.",
-        });
-      }
-
-      if (!Buffer.isBuffer(req.body)) {
-        console.error("WEBHOOK ERROR: Raw body is missing.");
-
-        return res.status(400).json({
-          received: false,
-          error: "Invalid webhook body.",
         });
       }
 
@@ -500,95 +272,42 @@ app.post(
       try {
         event = JSON.parse(req.body.toString("utf8"));
       } catch {
-        console.error("WEBHOOK ERROR: Invalid JSON.");
-
         return res.status(400).json({
           received: false,
           error: "Invalid JSON.",
         });
       }
 
-      console.log("FLUTTERWAVE WEBHOOK RECEIVED:", {
-        event: event?.event,
-        type: event?.type,
-      });
-
-      // Ignore unrelated event types.
-      const eventType = event?.event || event?.type;
-
-      if (
-        eventType &&
-        eventType !== "charge.completed"
-      ) {
+      if (event.event !== "charge.success") {
         return res.status(200).json({
           received: true,
           ignored: true,
         });
       }
 
-      const transactionId =
-        event?.data?.id ||
-        event?.data?.transaction_id;
+      const reference = event.data?.reference;
 
-      if (!transactionId) {
-        console.error("WEBHOOK ERROR: Transaction ID missing.");
-
+      if (!reference) {
         return res.status(200).json({
           received: true,
           ignored: true,
-          reason: "Transaction ID missing.",
+          reason: "Reference missing.",
         });
       }
 
-      // Verify directly with Flutterwave.
-      const payment = await verifyWithFlutterwave(
-        String(transactionId)
-      );
+      const pending = await findPendingPayment(reference);
 
-      if (!payment.tx_ref) {
-        throw new Error("Verified transaction has no tx_ref.");
-      }
-
-      validatePayment(payment, payment.tx_ref);
-
-      // Find the pending payment linked to this transaction.
-      const { data: pending, error: lookupError } = await supabase
-        .from("flutterwave_pending_payments")
-        .select("*")
-        .eq("tx_ref", payment.tx_ref)
-        .maybeSingle();
-
-      if (lookupError) {
-        console.error("WEBHOOK SUPABASE LOOKUP ERROR:", {
-          message: lookupError.message,
-          code: lookupError.code,
-          details: lookupError.details,
-        });
-
-        throw new Error("Could not look up pending payment.");
-      }
-
-      // No matching pending record: acknowledge the event so
-      // Flutterwave does not retry forever. Recovery can still
-      // be used after the pending record is corrected.
       if (!pending) {
-        console.error("WEBHOOK: No matching pending payment:", {
-          tx_ref: payment.tx_ref,
-          transaction_id: payment.id,
-        });
+        console.error("PAYSTACK WEBHOOK: Pending payment not found:", reference);
 
         return res.status(200).json({
           received: true,
           activated: false,
-          reason: "No matching pending payment.",
+          reason: "Pending payment not found.",
         });
       }
 
-      // If already paid, acknowledge duplicate webhook safely.
-      if (
-        pending.status === "paid" &&
-        String(pending.transaction_id) === String(payment.id)
-      ) {
+      if (pending.status === "paid") {
         return res.status(200).json({
           received: true,
           activated: true,
@@ -596,20 +315,17 @@ app.post(
         });
       }
 
-      await activateVerifiedPayment(payment, pending);
+      // Verify directly with Paystack. Never trust the webhook alone.
+      const payment = await verifyPaystackTransaction(reference);
 
-      console.log("FLUTTERWAVE WEBHOOK PROCESSED SUCCESSFULLY:", {
-        transaction_id: payment.id,
-        tx_ref: payment.tx_ref,
-        user_id: pending.user_id,
-      });
+      await activateVerifiedPayment(payment, pending);
 
       return res.status(200).json({
         received: true,
         activated: true,
       });
     } catch (error) {
-      console.error("WEBHOOK PROCESSING ERROR:", {
+      console.error("PAYSTACK WEBHOOK ERROR:", {
         message: error.message,
         stack: error.stack,
       });
@@ -622,8 +338,207 @@ app.post(
   }
 );
 
-// FLUTTERWAVE RETURN PAGE
-app.get("/api/flutterwave/redirect", (req, res) => {
+// JSON BODY PARSER FOR THE OTHER ROUTES
+app.use(express.json({ limit: "1mb" }));
+
+// PREPARE PAYSTACK PAYMENT
+app.post("/api/paystack/prepare", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Please sign in first.",
+      });
+    }
+
+    if (!user.email) {
+      return res.status(400).json({
+        error: "Your account needs an email address.",
+      });
+    }
+
+    const reference = `KENT-${user.id}-${crypto.randomUUID()}`;
+
+    const { error: insertError } = await supabase
+      .from("paystack_pending_payments")
+      .insert({
+        reference,
+        user_id: user.id,
+        email: user.email,
+        amount: PRICE_NAIRA,
+        currency: CURRENCY,
+        status: "pending",
+      });
+
+    if (insertError) {
+      console.error("CREATE PENDING PAYMENT ERROR:", insertError);
+
+      return res.status(500).json({
+        error: "Unable to prepare payment.",
+      });
+    }
+
+    const checkout = await paystackRequest(
+      "/transaction/initialize",
+      "POST",
+      {
+        email: user.email,
+        amount: String(PRICE_KOBO),
+        currency: CURRENCY,
+        reference,
+        callback_url:
+          "https://kent-stream.onrender.com/api/paystack/callback",
+        metadata: {
+          user_id: user.id,
+          product: "KENT STREAM Monthly Subscription",
+        },
+      }
+    );
+
+    if (!checkout.authorization_url || checkout.reference !== reference) {
+      throw new Error("Paystack checkout initialization was incomplete.");
+    }
+
+    return res.json({
+      status: "success",
+      public_key: process.env.PAYSTACK_PUBLIC_KEY,
+      reference,
+      amount: PRICE_NAIRA,
+      currency: CURRENCY,
+      authorization_url: checkout.authorization_url,
+      access_code: checkout.access_code,
+    });
+  } catch (error) {
+    console.error("PAYSTACK PREPARATION ERROR:", error);
+
+    return res.status(500).json({
+      error: "Payment preparation failed.",
+    });
+  }
+});
+
+// VERIFY PAYMENT FROM APP
+app.post("/api/paystack/verify", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Please sign in first.",
+      });
+    }
+
+    const reference = req.body?.reference;
+
+    if (typeof reference !== "string" || !reference.trim()) {
+      return res.status(400).json({
+        error: "Payment reference is required.",
+      });
+    }
+
+    const pending = await findPendingPayment(reference, user.id);
+
+    if (!pending) {
+      return res.status(404).json({
+        error: "Payment reference not found.",
+      });
+    }
+
+    if (pending.status === "paid") {
+      return res.json({
+        status: "success",
+        paid: true,
+        message: "Payment already confirmed.",
+      });
+    }
+
+    const payment = await verifyPaystackTransaction(reference);
+
+    await activateVerifiedPayment(payment, pending);
+
+    return res.json({
+      status: "success",
+      paid: true,
+      message: "Payment verified and subscription activated.",
+    });
+  } catch (error) {
+    console.error("PAYSTACK VERIFICATION ERROR:", {
+      message: error.message,
+      stack: error.stack,
+    });
+
+    return res.status(400).json({
+      error: "Payment could not be verified. Please contact support.",
+    });
+  }
+});
+
+// RECOVER EXISTING PAYSTACK PAYMENTS
+app.post("/api/paystack/recover", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Please sign in first.",
+      });
+    }
+
+    const { data: pendingPayments, error } = await supabase
+      .from("paystack_pending_payments")
+      .select("*")
+      .eq("user_id", user.id)
+      .eq("status", "pending")
+      .limit(10);
+
+    if (error) {
+      throw error;
+    }
+
+    if (!pendingPayments || pendingPayments.length === 0) {
+      return res.json({
+        status: "success",
+        paid: false,
+        message: "No pending Paystack payments were found.",
+      });
+    }
+
+    for (const pending of pendingPayments) {
+      try {
+        const payment = await verifyPaystackTransaction(pending.reference);
+
+        await activateVerifiedPayment(payment, pending);
+
+        return res.json({
+          status: "success",
+          paid: true,
+          message: "Your payment was recovered and activated.",
+        });
+      } catch (verificationError) {
+        console.log("PAYSTACK RECOVERY ATTEMPT:", {
+          reference: pending.reference,
+          reason: verificationError.message,
+        });
+      }
+    }
+
+    return res.json({
+      status: "success",
+      paid: false,
+      message: "No successful Paystack payment was found.",
+    });
+  } catch (error) {
+    console.error("PAYSTACK RECOVERY ERROR:", error);
+
+    return res.status(500).json({
+      error: "Payment recovery could not be completed.",
+    });
+  }
+});
+
+// PAYSTACK CALLBACK PAGE
+app.get("/api/paystack/callback", (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -639,9 +554,8 @@ app.get("/api/flutterwave/redirect", (req, res) => {
         padding:60px 20px;
       ">
         <h1 style="color:#E50920">KENT STREAM</h1>
-        <h2>Payment received</h2>
-        <p>Your transaction is being verified.</p>
-        <p>Return to the KENT STREAM app to check your subscription.</p>
+        <h2>Payment submitted</h2>
+        <p>Return to the KENT STREAM app to verify your subscription.</p>
       </body>
     </html>
   `);
