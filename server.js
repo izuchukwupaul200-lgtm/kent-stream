@@ -1,6 +1,7 @@
 ﻿
 const express = require("express");
 const crypto = require("crypto");
+const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -9,6 +10,20 @@ const PORT = process.env.PORT || 3000;
 const PRICE = 1200;
 const PRICE_KOBO = PRICE * 100;
 const CURRENCY = "NGN";
+
+// --------------------------------------------------
+// CORS CONFIGURATION
+// --------------------------------------------------
+
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept"
+  ],
+}));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -516,7 +531,7 @@ app.post(
       return res.json({
         status: "success",
         paid: true,
-        message: "Subscription payment verified and activated.",
+        message: "Payment verified and activated.",
       });
     } catch (error) {
       console.error("Payment verification error:", error);
