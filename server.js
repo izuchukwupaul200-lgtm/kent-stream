@@ -144,8 +144,6 @@ function validatePaystackPayment(payment, pending) {
     throw new Error("Payment currency mismatch.");
   }
 
-  // Paystack bank-transfer fees can increase the
-  // total amount. Validate the requested amount.
   const requestedAmount = Number(
     payment.requested_amount ?? payment.amount
   );
@@ -254,8 +252,6 @@ app.get("/health", (req, res) => {
 
 // --------------------------------------------------
 // INTERNATIONAL DISPLAY PRICING
-// Paystack still charges NGN.
-// Foreign currency amounts are estimates only.
 // --------------------------------------------------
 
 const COUNTRY_CURRENCIES = {
@@ -607,7 +603,7 @@ app.post(
 
 // --------------------------------------------------
 // PAYSTACK WEBHOOK
-// Verify signature using the original raw request body.
+// Keep the original raw body for signature checking.
 // --------------------------------------------------
 
 app.post(
@@ -660,7 +656,6 @@ app.post(
         });
       }
 
-      // Always verify the transaction directly with Paystack.
       const payment = await verifyWithPaystack(reference);
 
       const { data: pending, error } = await supabase
@@ -736,6 +731,12 @@ app.get("/api/paystack/callback", (req, res) => {
 });
 
 // --------------------------------------------------
+// KENT STREAM LIVE TV API
+// --------------------------------------------------
+
+app.use("/api/live-tv", require("./live_tv"));
+
+// --------------------------------------------------
 // START SERVER
 // --------------------------------------------------
 
@@ -744,4 +745,5 @@ app.listen(PORT, "0.0.0.0", () => {
     `KENT STREAM API running on port ${PORT}`
   );
   console.log("Payment gateway: Paystack");
+  console.log("Live TV API: connected");
 });
